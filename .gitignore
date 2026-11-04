@@ -1,0 +1,15 @@
+# Rust build output
+/target
+
+# macOS
+.DS_Store
+._*
+
+# Editors
+.idea/
+.vscode/
+*.swp
+
+# Local app bundles and disk images
+*.app
+*.dmg
