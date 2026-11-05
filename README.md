@@ -19,6 +19,12 @@ cargo build --release
 ./target/release/tslean
 ```
 
+## License
+
+Licensed under either of [Apache License 2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option.
+
+Binaries statically include third-party code under their own permissive licenses (libopus BSD-3-Clause, egui's bundled fonts under OFL-1.1 and the Ubuntu Font License, Rust crates under MIT, Apache-2.0, BSD, ISC, MPL-2.0 and Zlib). Ship their notices with any binary release, e.g. generated with [cargo-about](https://github.com/EmbarkStudios/cargo-about).
+
 ## Credits
 
 Built on [tsclientlib](https://github.com/ReSpeak/tsclientlib) by ReSpeak.
