@@ -35,7 +35,7 @@ const DARK: Palette = Palette {
     faint: Color32::from_rgb(92, 92, 97),
     hairline: Color32::from_rgb(38, 38, 40),
     hover: Color32::from_rgb(32, 32, 35),
-    accent: Color32::from_rgb(255, 95, 31),
+    accent: Color32::from_rgb(244, 114, 182),
 };
 
 const LIGHT: Palette = Palette {
@@ -46,7 +46,7 @@ const LIGHT: Palette = Palette {
     faint: Color32::from_rgb(168, 168, 170),
     hairline: Color32::from_rgb(230, 230, 227),
     hover: Color32::from_rgb(236, 236, 233),
-    accent: Color32::from_rgb(255, 79, 0),
+    accent: Color32::from_rgb(236, 72, 153),
 };
 
 pub fn install(ctx: &egui::Context) {
@@ -121,8 +121,8 @@ pub fn field(ui: &mut Ui, text: &mut String, hint: &str, password: bool) -> Resp
             .frame(false)
             .password(password)
             .hint_text(egui::RichText::new(hint).color(p.faint))
-            .font(FontId::proportional(15.0))
-            .margin(Vec2::new(0.0, 6.0))
+            .font(FontId::proportional(13.5))
+            .margin(Vec2::new(0.0, 4.0))
             .desired_width(f32::INFINITY),
     );
     let color = if resp.has_focus() { p.text } else { p.hairline };
@@ -158,12 +158,12 @@ pub fn primary_button(ui: &mut Ui, label: &str, enabled: bool) -> Response {
     let fill = if !enabled {
         p.faint
     } else if resp.hovered() {
-        p.text.gamma_multiply(0.85)
+        p.accent.gamma_multiply(0.85)
     } else {
-        p.text
+        p.accent
     };
     ui.painter().rect_filled(rect, CornerRadius::same(20), fill);
-    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, label, FontId::proportional(14.0), p.content);
+    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, label, FontId::proportional(14.0), Color32::WHITE);
     resp.on_hover_cursor(if enabled { egui::CursorIcon::PointingHand } else { egui::CursorIcon::Default })
 }
 

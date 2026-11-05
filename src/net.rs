@@ -1,17 +1,18 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use futures::prelude::*;
+use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tsclientlib::data::{Channel, Client, Connection as Book};
 use tsclientlib::events::{Event, PropertyId, PropertyValue};
 use tsclientlib::prelude::*;
 use tsclientlib::{
-    AudioEvent, ChannelId, ClientId, ClientType, Connection, DisconnectOptions, Identity, MessageTarget, StreamItem,
-    UidBuf,
+    AudioEvent, ChannelId, ChannelPermissionHint, ClientId, ClientPermissionHint, ClientType, Connection,
+    DisconnectOptions, Identity, MessageTarget, Reason, StreamItem, UidBuf,
 };
 use tsproto_packets::packets::{AudioData, OutPacket};
 
@@ -19,6 +20,9 @@ use crate::audio::{Controls, Playback, Sound};
 
 const CHAT_HISTORY: usize = 500;
 const TALK_TIMEOUT: Duration = Duration::from_millis(300);
+const ICON_MAX_BYTES: u64 = 256 * 1024;
+/// Ids below this are icons bundled with the official client, not stored on the server.
+pub const BUILTIN_ICON_MAX: u32 = 1000;
 
 pub struct Login {
     pub address: String,
@@ -34,9 +38,25 @@ pub enum Cmd {
     Connect(Login),
     Disconnect,
     Quit,
-    Join(ChannelId, Option<String>),
+    /// `None` moves the own client.
+    Move(Option<ClientId>, ChannelId, Option<String>),
+    MoveChannel {
+        id: ChannelId,
+        target: ChannelId,
+        after: bool,
+    },
+    EditChannel {
+        id: ChannelId,
+        name: Option<String>,
+        topic: Option<String>,
+        password: Option<String>,
+    },
+    Kick(ClientId, Reason),
     Chat(ChatTab, String),
-    SetMuted { input: bool, output: bool },
+    SetMuted {
+        input: bool,
+        output: bool,
+    },
     OpenDm(UidBuf, String),
     CloseDm(UidBuf),
     Playback(rtrb::Producer<Playback>),
@@ -72,9 +92,33 @@ pub enum SpacerAlign {
     Rule,
 }
 
+pub struct Badge {
+    pub icon: u32,
+    pub name: String,
+}
+
 pub enum Row {
-    Channel { id: ChannelId, name: String, depth: usize, spacer: Option<SpacerAlign>, locked: bool, topic: String },
-    Client { id: ClientId, uid: Option<UidBuf>, label: String, depth: usize, muted: bool, away: bool },
+    Channel {
+        id: ChannelId,
+        title: String,
+        name: String,
+        depth: usize,
+        spacer: Option<SpacerAlign>,
+        locked: bool,
+        topic: String,
+        perms: ChannelPermissionHint,
+    },
+    Client {
+        id: ClientId,
+        channel: ChannelId,
+        uid: Option<UidBuf>,
+        label: String,
+        depth: usize,
+        muted: bool,
+        away: bool,
+        badges: Vec<Badge>,
+        perms: ClientPermissionHint,
+    },
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -108,6 +152,8 @@ pub struct Shared {
     pub state: Mutex<Arc<State>>,
     /// Taken by the UI and persisted; set whenever the identity's security level grows.
     pub identity: Mutex<Option<Identity>>,
+    /// Downloaded group icon files by icon id, drained by the UI.
+    pub icons: Mutex<Vec<(u32, eframe::egui::ColorImage)>>,
 }
 
 impl State {
@@ -152,6 +198,8 @@ pub struct Net {
     playback: Option<rtrb::Producer<Playback>>,
     talk_seen: HashMap<ClientId, Instant>,
     volumes: HashMap<String, f32>,
+    icons_requested: HashSet<u32>,
+    icon_downloads: HashMap<u16, u32>,
 }
 
 pub fn spawn(
@@ -169,6 +217,8 @@ pub fn spawn(
         playback: None,
         talk_seen: HashMap::new(),
         volumes: HashMap::new(),
+        icons_requested: HashSet::new(),
+        icon_downloads: HashMap::new(),
     };
     let handle = std::thread::Builder::new()
         .name("net".into())
@@ -254,6 +304,8 @@ impl Net {
             opts = opts.password(login.password);
         }
         self.volumes = login.volumes;
+        self.icons_requested.clear();
+        self.icon_downloads.clear();
         let mut con = opts.connect()?;
         let mut tick = tokio::time::interval(TALK_TIMEOUT);
 
@@ -302,13 +354,35 @@ impl Net {
         }
         let Ok(book) = con.get_state() else { return Ok(()) };
         match cmd {
-            Cmd::Join(channel, password) => {
-                let own = book.clients.get(&book.own_client).ok_or_else(|| anyhow!("own client missing"))?;
-                let mut part = own.client_move(channel);
+            Cmd::Move(client, channel, password) => {
+                let Some(c) = book.clients.get(&client.unwrap_or(book.own_client)) else { return Ok(()) };
+                let mut part = c.client_move(channel);
                 if let Some(pw) = &password {
                     part = part.set_password(pw);
                 }
-                part.send(con)?;
+                part.send_with_result(con)?;
+            }
+            Cmd::MoveChannel { id, target, after } => {
+                let (Some(ch), Some(t)) = (book.channels.get(&id), book.channels.get(&target)) else { return Ok(()) };
+                ch.channel_move(t.parent, if after { target } else { t.order }).send_with_result(con)?;
+            }
+            Cmd::EditChannel { id, name, topic, password } => {
+                let Some(ch) = book.channels.get(&id) else { return Ok(()) };
+                let mut part = ch.edit();
+                if let Some(name) = &name {
+                    part = part.set_name(name);
+                }
+                if let Some(topic) = &topic {
+                    part = part.set_topic(topic);
+                }
+                if let Some(pw) = &password {
+                    part = part.set_password(Some(pw));
+                }
+                part.send_with_result(con)?;
+            }
+            Cmd::Kick(client, reason) => {
+                let Some(c) = book.clients.get(&client) else { return Ok(()) };
+                c.kick(reason).send_with_result(con)?;
             }
             Cmd::Chat(tab, text) => {
                 let target = match &tab {
@@ -388,6 +462,24 @@ impl Net {
                     self.state.output_muted = own.is_some_and(|c| c.output_muted);
                     self.state.tree = Arc::new(build_tree(book));
                 }
+                let groups_added = events.iter().any(|e| {
+                    matches!(
+                        e,
+                        Event::PropertyAdded { id: PropertyId::ServerGroup(_) | PropertyId::ChannelGroup(_), .. }
+                    )
+                });
+                if groups_added {
+                    let icons: Vec<u32> = (book.server_groups.values().map(|g| g.icon))
+                        .chain(book.channel_groups.values().map(|g| g.icon))
+                        .map(|i| i.0)
+                        .filter(|&i| i >= BUILTIN_ICON_MAX && self.icons_requested.insert(i))
+                        .collect();
+                    for icon in icons {
+                        if let Ok(h) = con.download_file(ChannelId(0), &format!("/icon_{icon}"), None, None) {
+                            self.icon_downloads.insert(h.0, icon);
+                        }
+                    }
+                }
                 self.publish();
             }
             StreamItem::Audio(packet) => {
@@ -412,6 +504,31 @@ impl Net {
                 self.state.status = Status::Connecting;
                 self.state.system(format!("Connection lost ({reason:?}), reconnecting…"));
                 self.publish();
+            }
+            StreamItem::MessageResult(_, Err(e)) => {
+                self.state.system(e.to_string());
+                self.publish();
+            }
+            StreamItem::FileDownload(h, mut dl) => {
+                let Some(icon) = self.icon_downloads.remove(&h.0).filter(|_| dl.size <= ICON_MAX_BYTES) else {
+                    return Ok(());
+                };
+                let (shared, ctx) = (self.shared.clone(), self.ctx.clone());
+                tokio::spawn(async move {
+                    let mut bytes = Vec::with_capacity(dl.size as usize);
+                    if dl.stream.read_to_end(&mut bytes).await.is_err() {
+                        return;
+                    }
+                    if let Ok(img) = eframe::icon_data::from_png_bytes(&bytes) {
+                        let size = [img.width as usize, img.height as usize];
+                        let image = eframe::egui::ColorImage::from_rgba_unmultiplied(size, &img.rgba);
+                        shared.icons.lock().unwrap().push((icon, image));
+                        ctx.request_repaint();
+                    }
+                });
+            }
+            StreamItem::FiletransferFailed(h, _) => {
+                self.icon_downloads.remove(&h.0);
             }
             StreamItem::IdentityLevelIncreased => {
                 *self.shared.identity.lock().unwrap() = con.get_options().get_identity().cloned();
@@ -521,12 +638,13 @@ fn build_tree(book: &Book) -> Vec<Row> {
         list.sort_by_cached_key(|c| (std::cmp::Reverse(c.talk_power), c.name.to_lowercase()));
     }
     let mut rows = Vec::with_capacity(book.channels.len() + book.clients.len());
-    push_channels(&mut rows, &children, &clients, ChannelId(0), 0);
+    push_channels(&mut rows, book, &children, &clients, ChannelId(0), 0);
     rows
 }
 
 fn push_channels(
     rows: &mut Vec<Row>,
+    book: &Book,
     children: &HashMap<ChannelId, Vec<&Channel>>,
     clients: &HashMap<ChannelId, Vec<&Client>>,
     parent: ChannelId,
@@ -539,11 +657,13 @@ fn push_channels(
         };
         rows.push(Row::Channel {
             id: ch.id,
+            title: ch.name.clone(),
             name,
             depth,
             spacer,
             locked: ch.has_password.unwrap_or(false),
             topic: ch.topic.clone().unwrap_or_default(),
+            perms: ch.permission_hints.unwrap_or(ChannelPermissionHint::all()),
         });
         for c in clients.get(&ch.id).into_iter().flatten() {
             let label = match c.away_message.as_deref() {
@@ -553,15 +673,29 @@ fn push_channels(
             };
             rows.push(Row::Client {
                 id: c.id,
+                channel: c.channel,
                 uid: c.uid.clone(),
                 label,
                 depth: depth + 1,
                 muted: c.input_muted || !c.input_hardware_enabled || c.output_muted || !c.output_hardware_enabled,
                 away: c.away_message.is_some(),
+                badges: badges(book, c),
+                perms: c.permission_hints.unwrap_or(ClientPermissionHint::all()),
             });
         }
-        push_channels(rows, children, clients, ch.id, depth + 1);
+        push_channels(rows, book, children, clients, ch.id, depth + 1);
     }
+}
+
+fn badges(book: &Book, c: &Client) -> Vec<Badge> {
+    let mut groups: Vec<_> = c.server_groups.iter().filter_map(|g| book.server_groups.get(g)).collect();
+    groups.sort_by_key(|g| g.sort_id);
+    let channel_group = book.channel_groups.get(&c.channel_group).map(|g| (g.icon, &g.name));
+    (channel_group.into_iter())
+        .chain(groups.into_iter().map(|g| (g.icon, &g.name)))
+        .filter(|(icon, _)| icon.0 != 0)
+        .map(|(icon, name)| Badge { icon: icon.0, name: name.clone() })
+        .collect()
 }
 
 fn order_siblings(list: &mut Vec<&Channel>) {

@@ -4,6 +4,7 @@ mod emoji;
 mod net;
 mod theme;
 
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
@@ -13,11 +14,11 @@ use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Rect, RichText, 
 use global_hotkey::hotkey::HotKey;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use tokio::sync::mpsc;
-use tsclientlib::{ChannelId, Identity};
+use tsclientlib::{ChannelId, ChannelPermissionHint, ClientId, ClientPermissionHint, Identity, Reason};
 
 use audio::{Audio, Controls};
-use config::{Appearance, Config, VoiceMode};
-use net::{ChatTab, Cmd, Login, Row, Shared, SpacerAlign, State, Status};
+use config::{Appearance, Config, Recent, VoiceMode};
+use net::{BUILTIN_ICON_MAX, ChatTab, Cmd, Login, Row, Shared, SpacerAlign, State, Status};
 use theme::p;
 
 const SIDEBAR_W: f32 = 264.0;
@@ -25,6 +26,7 @@ const TITLEBAR_H: f32 = 52.0;
 const ROW_H: f32 = 28.0;
 const PAD: f32 = 20.0;
 const INDENT: f32 = 14.0;
+const RECENT_MAX: usize = 10;
 
 struct App {
     cfg: Config,
@@ -44,6 +46,23 @@ struct App {
     tab: ChatTab,
     draft: String,
     join_password: Option<(ChannelId, String)>,
+    edit_channel: Option<ChannelEdit>,
+    icons: HashMap<u32, egui::TextureHandle>,
+}
+
+struct ChannelEdit {
+    id: ChannelId,
+    name: String,
+    topic: String,
+    password: String,
+    orig_name: String,
+    orig_topic: String,
+}
+
+#[derive(Clone, Copy)]
+enum Drag {
+    Client(ClientId, ChannelId),
+    Channel(ChannelId),
 }
 
 impl App {
@@ -79,6 +98,8 @@ impl App {
             tab: ChatTab::Channel,
             draft: String::new(),
             join_password: None,
+            edit_channel: None,
+            icons: HashMap::new(),
         };
         app.start_audio(&cc.egui_ctx);
         app.apply_hotkey();
@@ -124,6 +145,14 @@ impl App {
 
     fn connect(&mut self) {
         let identity = self.cfg.identity.get_or_insert_with(Identity::create).clone();
+        let entry = Recent {
+            address: self.cfg.address.trim().to_string(),
+            nickname: self.cfg.nickname.trim().to_string(),
+            password: self.cfg.server_password.clone(),
+        };
+        self.cfg.recent.retain(|r| r.address != entry.address);
+        self.cfg.recent.insert(0, entry);
+        self.cfg.recent.truncate(RECENT_MAX);
         self.cfg.save();
         let _ = self.cmd.send(Cmd::Connect(Login {
             address: self.cfg.address.trim().to_string(),
@@ -141,29 +170,35 @@ impl App {
         self.cfg.input_muted = input;
         self.cfg.output_muted = output;
         self.cfg.save();
-        let _ = self.cmd.send(Cmd::SetMuted { input, output });
+        let _ = self.cmd.send(Cmd::SetMuted { input: input || self.controls.hear_self.load(Relaxed), output });
+    }
+
+    fn set_hear_self(&mut self, on: bool) {
+        self.controls.hear_self.store(on, Relaxed);
+        self.set_muted(self.cfg.input_muted, self.cfg.output_muted);
     }
 
     fn connect_view(&mut self, ctx: &egui::Context, s: &State) {
         egui::CentralPanel::default().frame(egui::Frame::new().fill(p().content)).show(ctx, |ui| {
             drag_region(ui, ui.max_rect().width());
-            let size = Vec2::new(320.0, 420.0);
-            let rect = Rect::from_center_size(ui.max_rect().center(), size);
+            let area = ui.max_rect();
+            let rect = Rect::from_min_size(
+                egui::pos2(area.center().x - 140.0, area.top() + area.height() * 0.18),
+                Vec2::new(280.0, area.height() * 0.8),
+            );
             ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
-                theme::caption(ui, "TSLean");
-                ui.add_space(6.0);
-                ui.label(RichText::new("Connect to a server").size(26.0));
-                ui.add_space(32.0);
+                ui.label(RichText::new("Connect").size(17.0));
+                ui.add_space(16.0);
 
                 theme::caption(ui, "Server");
                 theme::field(ui, &mut self.cfg.address, "voice.example.com", false);
-                ui.add_space(20.0);
+                ui.add_space(10.0);
                 theme::caption(ui, "Nickname");
                 theme::field(ui, &mut self.cfg.nickname, "Your name", false);
-                ui.add_space(20.0);
+                ui.add_space(10.0);
                 theme::caption(ui, "Password");
                 theme::field(ui, &mut self.cfg.server_password, "Optional", true);
-                ui.add_space(32.0);
+                ui.add_space(18.0);
 
                 let connecting = s.status == Status::Connecting;
                 let ready = !connecting && !self.cfg.address.trim().is_empty() && !self.cfg.nickname.trim().is_empty();
@@ -177,8 +212,59 @@ impl App {
                     ui.add_space(14.0);
                     ui.label(RichText::new(e).size(12.0).color(p().accent));
                 }
+                if !self.cfg.recent.is_empty() {
+                    ui.add_space(28.0);
+                    theme::caption(ui, "Recent");
+                    ui.add_space(4.0);
+                    self.recent_list(ui, !connecting);
+                }
             });
         });
+    }
+
+    fn recent_list(&mut self, ui: &mut egui::Ui, enabled: bool) {
+        let mut pick = None;
+        let mut remove = None;
+        for (i, r) in self.cfg.recent.iter().enumerate() {
+            let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_H), Sense::click());
+            if resp.hovered() {
+                ui.painter().rect_filled(rect.expand2(Vec2::new(8.0, 0.0)), CornerRadius::same(6), p().hover);
+            }
+            let y = rect.center().y;
+            ui.painter().text(
+                egui::pos2(rect.left(), y),
+                Align2::LEFT_CENTER,
+                &r.address,
+                FontId::proportional(13.5),
+                p().text,
+            );
+            ui.painter().text(
+                egui::pos2(rect.right(), y),
+                Align2::RIGHT_CENTER,
+                &r.nickname,
+                FontId::proportional(11.5),
+                p().faint,
+            );
+            if resp.clicked() && enabled {
+                pick = Some(i);
+            }
+            resp.on_hover_cursor(egui::CursorIcon::PointingHand).context_menu(|ui| {
+                if ui.button("Remove").clicked() {
+                    remove = Some(i);
+                    ui.close_menu();
+                }
+            });
+        }
+        if let Some(i) = remove {
+            self.cfg.recent.remove(i);
+            self.cfg.save();
+        }
+        if let Some(r) = pick.map(|i| self.cfg.recent[i].clone()) {
+            self.cfg.address = r.address;
+            self.cfg.nickname = r.nickname;
+            self.cfg.server_password = r.password;
+            self.connect();
+        }
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui, s: &State) {
@@ -259,9 +345,25 @@ impl App {
         egui::ScrollArea::vertical().auto_shrink(false).show_rows(ui, ROW_H, rows.len(), |ui, range| {
             ui.spacing_mut().item_spacing.y = 0.0;
             for row in &rows[range] {
-                let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_H), Sense::click());
-                let painter = ui.painter();
+                let drag = match row {
+                    Row::Channel { id, perms, .. } if perms.contains(ChannelPermissionHint::MODIFY) => {
+                        Some(Drag::Channel(*id))
+                    }
+                    Row::Client { id, channel, perms, .. }
+                        if s.own_id == Some(*id) || perms.contains(ClientPermissionHint::MOVE_CLIENT) =>
+                    {
+                        Some(Drag::Client(*id, *channel))
+                    }
+                    _ => None,
+                };
+                let sense = if drag.is_some() { Sense::click_and_drag() } else { Sense::click() };
+                let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_H), sense);
+                if let Some(d) = drag {
+                    resp.dnd_set_drag_payload(d);
+                }
                 let wash = rect.shrink2(Vec2::new(8.0, 1.0));
+                self.drop_target(ui, s, row, wash, &resp);
+                let painter = ui.painter();
                 match row {
                     Row::Channel { name, spacer: Some(align), .. } => {
                         let y = rect.center().y;
@@ -287,7 +389,7 @@ impl App {
                             }
                         }
                     }
-                    Row::Channel { id, name, depth, locked, topic, .. } => {
+                    Row::Channel { id, title, name, depth, locked, topic, perms, .. } => {
                         let own = s.own_channel == Some(*id);
                         let hovered = resp.hovered() && !own;
                         if hovered {
@@ -301,12 +403,23 @@ impl App {
                             theme::lock(painter, egui::pos2(rect.right() - PAD - 2.0, rect.bottom() - 12.0), p().faint);
                         }
                         let resp = if topic.is_empty() { resp } else { resp.on_hover_text(topic) };
+                        if perms.contains(ChannelPermissionHint::MODIFY) {
+                            resp.context_menu(|ui| {
+                                if ui.button("Edit channel").clicked() {
+                                    self.edit_channel = Some(ChannelEdit {
+                                        id: *id,
+                                        name: title.clone(),
+                                        topic: topic.clone(),
+                                        password: String::new(),
+                                        orig_name: title.clone(),
+                                        orig_topic: topic.clone(),
+                                    });
+                                    ui.close_menu();
+                                }
+                            });
+                        }
                         if resp.clicked() && !own {
-                            if *locked {
-                                self.join_password = Some((*id, String::new()));
-                            } else {
-                                let _ = self.cmd.send(Cmd::Join(*id, None));
-                            }
+                            self.move_client(s, None, *id, *locked);
                         }
                         resp.on_hover_cursor(if own {
                             egui::CursorIcon::Default
@@ -314,7 +427,7 @@ impl App {
                             egui::CursorIcon::PointingHand
                         });
                     }
-                    Row::Client { id, uid, label, depth, muted, away } => {
+                    Row::Client { id, uid, label, depth, muted, away, badges, perms, .. } => {
                         let is_self = s.own_id == Some(*id);
                         let talking = s.talking.contains(id);
                         if resp.hovered() && !is_self {
@@ -347,6 +460,26 @@ impl App {
                             theme::slash(painter, c, p().faint);
                             right -= 20.0;
                         }
+                        for b in badges.iter().rev() {
+                            let r = Rect::from_center_size(egui::pos2(right - 8.0, rect.center().y), Vec2::splat(16.0));
+                            if let Some(tex) = self.icons.get(&b.icon) {
+                                egui::Image::new(tex).paint_at(ui, r);
+                            } else if b.icon < BUILTIN_ICON_MAX {
+                                let initial = b.name.chars().next().unwrap_or('?').to_uppercase().to_string();
+                                painter.rect_filled(r.shrink(1.0), CornerRadius::same(4), p().hover);
+                                painter.text(
+                                    r.center(),
+                                    Align2::CENTER_CENTER,
+                                    initial,
+                                    FontId::proportional(9.5),
+                                    p().secondary,
+                                );
+                            } else {
+                                continue;
+                            }
+                            ui.interact(r, ui.id().with((id, b.icon)), Sense::hover()).on_hover_text(&b.name);
+                            right -= 20.0;
+                        }
                         let volume = uid
                             .as_ref()
                             .filter(|_| !self.cfg.volumes.is_empty())
@@ -357,7 +490,20 @@ impl App {
                             painter.text(pos, Align2::RIGHT_CENTER, text, FontId::proportional(11.0), p().faint);
                         }
                         if let (Some(uid), false) = (uid, is_self) {
-                            resp.context_menu(|ui| self.volume_menu(ui, uid, label));
+                            resp.context_menu(|ui| {
+                                self.volume_menu(ui, uid, label);
+                                for (hint, reason, text) in [
+                                    (ClientPermissionHint::KICK_CHANNEL, Reason::KickChannel, "Kick from channel"),
+                                    (ClientPermissionHint::KICK_SERVER, Reason::KickServer, "Kick from server"),
+                                ] {
+                                    if perms.contains(hint)
+                                        && ui.button(RichText::new(text).size(12.0).color(p().accent)).clicked()
+                                    {
+                                        let _ = self.cmd.send(Cmd::Kick(*id, reason));
+                                        ui.close_menu();
+                                    }
+                                }
+                            });
                         }
                         if resp.clicked() && !is_self {
                             if let Some(uid) = uid {
@@ -370,6 +516,38 @@ impl App {
                 }
             }
         });
+    }
+
+    fn move_client(&mut self, s: &State, client: Option<ClientId>, channel: ChannelId, locked: bool) {
+        if locked && (client.is_none() || client == s.own_id) {
+            self.join_password = Some((channel, String::new()));
+        } else {
+            let _ = self.cmd.send(Cmd::Move(client, channel, None));
+        }
+    }
+
+    /// Clients drop into the row's channel; channels drop as the sibling before or after the row.
+    fn drop_target(&mut self, ui: &egui::Ui, s: &State, row: &Row, wash: Rect, resp: &egui::Response) {
+        let Some(drag) = resp.dnd_hover_payload::<Drag>() else { return };
+        let released = resp.dnd_release_payload::<Drag>().is_some();
+        match (*drag, row) {
+            (Drag::Client(client, from), Row::Channel { id, .. } | Row::Client { channel: id, .. }) if from != *id => {
+                ui.painter().rect_filled(wash, CornerRadius::same(6), p().accent.gamma_multiply(0.15));
+                if released {
+                    let locked = matches!(row, Row::Channel { locked: true, .. });
+                    self.move_client(s, Some(client), *id, locked);
+                }
+            }
+            (Drag::Channel(src), Row::Channel { id, .. }) if src != *id => {
+                let after = ui.input(|i| i.pointer.interact_pos()).is_some_and(|p| p.y > wash.center().y);
+                let y = if after { wash.bottom() } else { wash.top() };
+                ui.painter().hline(wash.x_range(), y, Stroke::new(2.0f32, p().accent));
+                if released {
+                    let _ = self.cmd.send(Cmd::MoveChannel { id: src, target: *id, after });
+                }
+            }
+            _ => {}
+        }
     }
 
     fn volume_menu(&mut self, ui: &mut egui::Ui, uid: &tsclientlib::UidBuf, name: &str) {
@@ -608,6 +786,15 @@ impl App {
                 }
             }
             ui.add_space(20.0);
+            theme::caption(ui, "Hear myself");
+            ui.add_space(4.0);
+            let mut hear_self = self.controls.hear_self.load(Relaxed);
+            if theme::segmented(ui, &mut hear_self, &[(false, "Off"), (true, "On")]) {
+                self.set_hear_self(hear_self);
+            }
+            ui.add_space(6.0);
+            ui.label(RichText::new("Plays your mic back and mutes you in the channel.").size(11.0).color(p().faint));
+            ui.add_space(20.0);
             theme::caption(ui, "Devices");
             ui.label(RichText::new("Follows the macOS default input and output.").size(12.5).color(p().secondary));
             if let Some(e) = &self.audio_error {
@@ -616,10 +803,46 @@ impl App {
         });
         if modal.should_close() {
             self.settings_open = false;
+            if self.controls.hear_self.load(Relaxed) {
+                self.set_hear_self(false);
+            }
             if self.recording {
                 self.recording = false;
                 self.apply_hotkey();
             }
+        }
+    }
+
+    fn channel_editor(&mut self, ctx: &egui::Context) {
+        let Some(mut e) = self.edit_channel.take() else { return };
+        let mut submit = false;
+        let modal = egui::Modal::new(egui::Id::new("edit_channel")).frame(sheet()).show(ctx, |ui| {
+            ui.set_width(320.0);
+            ui.label(RichText::new("Edit channel").size(17.0));
+            ui.add_space(20.0);
+            theme::caption(ui, "Name");
+            theme::field(ui, &mut e.name, "", false);
+            ui.add_space(20.0);
+            theme::caption(ui, "Topic");
+            theme::field(ui, &mut e.topic, "Optional", false);
+            ui.add_space(20.0);
+            theme::caption(ui, "New password");
+            theme::field(ui, &mut e.password, "Unchanged", true);
+            ui.add_space(22.0);
+            let ready = !e.name.trim().is_empty();
+            submit = theme::primary_button(ui, "Save", ready).clicked()
+                || (ready && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+        });
+        if submit {
+            let name = e.name.trim().to_string();
+            let _ = self.cmd.send(Cmd::EditChannel {
+                id: e.id,
+                name: (name != e.orig_name).then_some(name),
+                topic: (e.topic != e.orig_topic).then_some(e.topic),
+                password: (!e.password.is_empty()).then_some(e.password),
+            });
+        } else if !modal.should_close() {
+            self.edit_channel = Some(e);
         }
     }
 
@@ -637,7 +860,7 @@ impl App {
                 || (!pw.is_empty() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
         });
         if submit {
-            let _ = self.cmd.send(Cmd::Join(id, Some(pw)));
+            let _ = self.cmd.send(Cmd::Move(None, id, Some(pw)));
         } else if !modal.should_close() {
             self.join_password = Some((id, pw));
         }
@@ -741,6 +964,10 @@ impl eframe::App for App {
             self.cfg.save();
         }
         let s = self.shared.state.lock().unwrap().clone();
+        let downloaded = std::mem::take(&mut *self.shared.icons.lock().unwrap());
+        for (id, image) in downloaded {
+            self.icons.insert(id, ctx.load_texture(format!("icon_{id}"), image, Default::default()));
+        }
 
         if s.tree.is_empty() {
             self.connect_view(ctx, &s);
@@ -756,6 +983,7 @@ impl eframe::App for App {
         }
         self.settings(ctx);
         self.password_prompt(ctx);
+        self.channel_editor(ctx);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {

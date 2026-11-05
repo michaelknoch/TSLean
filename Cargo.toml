@@ -21,7 +21,7 @@ rtrb = "0.4.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 slog = "2"
-tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "io-util"] }
 tsclientlib = "0.2"
 tsproto-packets = "0.1"
 unicode-segmentation = "1.13.3"

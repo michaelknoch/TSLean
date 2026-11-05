@@ -43,6 +43,14 @@ pub struct Config {
     pub appearance: Appearance,
     /// Playback volume per user, keyed by their unique identity.
     pub volumes: HashMap<String, f32>,
+    pub recent: Vec<Recent>,
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct Recent {
+    pub address: String,
+    pub nickname: String,
+    pub password: String,
 }
 
 impl Default for Config {
@@ -59,6 +67,7 @@ impl Default for Config {
             output_muted: false,
             appearance: Appearance::System,
             volumes: HashMap::new(),
+            recent: Vec::new(),
         }
     }
 }

@@ -67,6 +67,8 @@ pub struct Controls {
     pub threshold_db: AtomicF32,
     pub level_db: AtomicF32,
     pub can_send: AtomicBool,
+    /// Routes the gated mic to the local output instead of the server.
+    pub hear_self: AtomicBool,
 }
 
 impl Controls {
@@ -77,6 +79,7 @@ impl Controls {
             threshold_db: AtomicF32::new(threshold_db),
             level_db: AtomicF32::new(-100.0),
             can_send: AtomicBool::new(false),
+            hear_self: AtomicBool::new(false),
         }
     }
 }
@@ -95,9 +98,10 @@ impl Audio {
         on_lost: impl Fn() + Send + Clone + 'static,
     ) -> Result<Self> {
         let host = cpal::default_host();
+        let (monitor_tx, monitor_rx) = rtrb::RingBuffer::new(RATE as usize / 5);
         Ok(Self {
-            _input: open_input(&host, controls, mic_tx, on_lost.clone())?,
-            _output: open_output(&host, playback, on_lost)?,
+            _input: open_input(&host, controls, mic_tx, monitor_tx, on_lost.clone())?,
+            _output: open_output(&host, playback, monitor_rx, on_lost)?,
         })
     }
 }
@@ -132,6 +136,7 @@ fn open_input(
     host: &cpal::Host,
     controls: Arc<Controls>,
     tx: mpsc::Sender<Mic>,
+    mut monitor: rtrb::Producer<f32>,
     on_lost: impl Fn() + Send + 'static,
 ) -> Result<cpal::Stream> {
     let device = host.default_input_device().ok_or_else(|| anyhow!("no microphone found"))?;
@@ -177,7 +182,13 @@ fn open_input(
                     } else {
                         now.duration_since(last_loud) < VAD_HOLD
                     };
-                    let sending = gate && controls.can_send.load(Relaxed);
+                    let hear_self = controls.hear_self.load(Relaxed);
+                    if gate && hear_self {
+                        for s in frame {
+                            let _ = monitor.push(s);
+                        }
+                    }
+                    let sending = gate && !hear_self && controls.can_send.load(Relaxed);
 
                     let payload = match (sending, was_sending) {
                         (true, _) => encoder.encode_float(&frame, &mut opus_out).ok().map(|n| &opus_out[..n]),
@@ -204,6 +215,7 @@ fn open_input(
 fn open_output(
     host: &cpal::Host,
     mut playback: rtrb::Consumer<Playback>,
+    mut monitor: rtrb::Consumer<f32>,
     on_lost: impl Fn() + Send + 'static,
 ) -> Result<cpal::Stream> {
     let device = host.default_output_device().ok_or_else(|| anyhow!("no output device found"))?;
@@ -247,6 +259,11 @@ fn open_output(
                     if pos == src.len() {
                         src.fill(0.0);
                         handler.fill_buffer(&mut src);
+                        for frame in src.chunks_exact_mut(2) {
+                            let Ok(v) = monitor.pop() else { break };
+                            frame[0] += v;
+                            frame[1] += v;
+                        }
                         if let Some((which, at)) = &mut sound {
                             let tail = &sounds[*which][*at..];
                             for (frame, v) in src.chunks_exact_mut(2).zip(tail) {
