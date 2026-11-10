@@ -16,7 +16,7 @@ use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use tokio::sync::mpsc;
 use tsclientlib::{ChannelId, ChannelPermissionHint, ClientId, ClientPermissionHint, Identity, Reason};
 
-use audio::{Audio, Controls};
+use audio::{Audio, Controls, Playback};
 use config::{Appearance, Config, Recent, VoiceMode};
 use net::{BUILTIN_ICON_MAX, ChatTab, Cmd, Login, Row, Shared, SpacerAlign, State, Status};
 use theme::p;
@@ -35,7 +35,8 @@ struct App {
     net: Option<std::thread::JoinHandle<()>>,
     controls: Arc<Controls>,
     mic_tx: mpsc::Sender<net::Mic>,
-    _audio: Option<Audio>,
+    audio: Option<(std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>)>,
+    audio_pending: Option<std::sync::mpsc::Receiver<Result<rtrb::Producer<Playback>, String>>>,
     audio_error: Option<String>,
     audio_lost: Arc<AtomicBool>,
     hotkeys: Option<GlobalHotKeyManager>,
@@ -87,7 +88,8 @@ impl App {
             net: Some(net),
             controls,
             mic_tx,
-            _audio: None,
+            audio: None,
+            audio_pending: None,
             audio_error: None,
             audio_lost: Arc::new(AtomicBool::new(false)),
             hotkeys: GlobalHotKeyManager::new().ok(),
@@ -107,21 +109,41 @@ impl App {
     }
 
     fn start_audio(&mut self, ctx: &egui::Context) {
-        self._audio = None;
-        let (producer, consumer) = rtrb::RingBuffer::new(512);
-        let lost = self.audio_lost.clone();
-        let ctx = ctx.clone();
-        let on_lost = move || {
-            lost.store(true, Relaxed);
+        let old = self.audio.take();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.audio_pending = Some(rx);
+        let (controls, mic_tx, lost, ctx) = (self.controls.clone(), self.mic_tx.clone(), self.audio_lost.clone(), ctx.clone());
+        let handle = std::thread::spawn(move || {
+            if let Some((stop, thread)) = old {
+                drop(stop);
+                let _ = thread.join();
+            }
+            let (producer, consumer) = rtrb::RingBuffer::new(512);
+            let repaint = ctx.clone();
+            let on_lost = move || {
+                lost.store(true, Relaxed);
+                repaint.request_repaint();
+            };
+            let audio = Audio::start(controls, mic_tx, consumer, on_lost);
+            let _ = tx.send(audio.as_ref().map(|_| producer).map_err(|e| e.to_string()));
             ctx.request_repaint();
-        };
-        match Audio::start(self.controls.clone(), self.mic_tx.clone(), consumer, on_lost) {
-            Ok(a) => {
-                self._audio = Some(a);
+            if audio.is_ok() {
+                let _ = stop_rx.recv();
+            }
+        });
+        self.audio = Some((stop_tx, handle));
+    }
+
+    fn poll_audio(&mut self) {
+        let Some(Ok(result)) = self.audio_pending.as_ref().map(|rx| rx.try_recv()) else { return };
+        self.audio_pending = None;
+        match result {
+            Ok(producer) => {
                 self.audio_error = None;
                 let _ = self.cmd.send(Cmd::Playback(producer));
             }
-            Err(e) => self.audio_error = Some(e.to_string()),
+            Err(e) => self.audio_error = Some(e),
         }
     }
 
@@ -959,6 +981,7 @@ impl eframe::App for App {
         if self.audio_lost.swap(false, Relaxed) {
             self.start_audio(ctx);
         }
+        self.poll_audio();
         if let Some(identity) = self.shared.identity.lock().unwrap().take() {
             self.cfg.identity = Some(identity);
             self.cfg.save();
